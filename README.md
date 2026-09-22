@@ -1,2 +1,213 @@
-# Portable-PCB-Helath-scanner-
-ARM-based PCB health assessment system using **STM32F446RE** to perform multi-frequency signal testing, FFT analysis, and electronic signature generation for non-destructive fault diagnosis.
+# Portable PCB Health Scanner
+
+**Electronic Signature Analysis for Automated, Non-Invasive PCB Fault Diagnosis**
+
+A low-cost, portable, ARM-based (STM32F4) diagnostic tool that detects PCB faults by
+injecting a test signal into a board's rails/test points and comparing the FFT-derived
+frequency response against a self-taught "known-good" baseline — no schematic, netlist,
+or bed-of-nails fixture required.
+
+> Status: Software pipeline complete and validated on synthetic data (95%). Hardware
+> procurement and PCB fabrication in progress (50%). See [Project Status](#project-status).
+
+---
+
+## Table of Contents
+
+- [Problem](#problem)
+- [Approach](#approach)
+- [Architecture](#architecture)
+- [Repository Structure](#repository-structure)
+- [Getting Started](#getting-started)
+- [Pipeline Walkthrough](#pipeline-walkthrough)
+- [Fault Types Detected](#fault-types-detected)
+- [Known Issues & Fixes](#known-issues--fixes)
+- [Project Status](#project-status)
+- [Roadmap](#roadmap)
+- [Team](#team)
+
+---
+
+## Problem
+
+PCB fault diagnosis in manufacturing, repair, and field-maintenance settings is still
+mostly manual:
+
+- Multimeters, oscilloscopes, and visual inspection are slow, subjective, and
+  skill-dependent.
+- Automated Optical Inspection (AOI) and In-Circuit Test (ICT) rigs exist, but are
+  expensive, bulky, factory-fixed systems — not viable for field service, repair shops,
+  or small-scale manufacturers.
+- Intermittent faults (thermal drift, micro-cracks, degrading capacitors) are hard to
+  catch under static, no-power checks.
+
+There is no affordable, portable, non-invasive tool that lets a technician "scan" a
+board the way a stethoscope diagnoses a body.
+
+## Approach
+
+This project reimplements **Electronic Circuit Signature Analysis (ECSA)** — an
+established technique in aerospace/high-reliability maintenance, normally confined to
+bench equipment costing $3,000+ (e.g. Huntron Tracker) — on a portable, low-cost ARM
+platform:
+
+1. Inject a test signal into a board's rails/test points.
+2. Sample the response and convert it to the frequency domain (FFT).
+3. Compare the resulting "signature" against a technician-taught, known-good baseline.
+4. Flag and classify deviations as specific fault types.
+
+No schematic, netlist, or boundary-scan access is required — only probe contact.
+
+## Architecture
+
+```
+STM32F4 Signal Generation (DAC/PWM)
+        │
+        ▼
+Analog Front-End (protection diodes → op-amp buffer → ESD array)
+        │
+        ▼
+PCB Under Test (probe contact)
+        │
+        ▼
+ADC Sampling → FFT Signature Extraction
+        │
+        ▼
+Baseline Comparison + Fault Classification
+        │
+        ▼
+GUI Display (PyQt5) + SQLite Logging
+```
+
+The analog front-end chain is used **bidirectionally**: the same protection/buffering
+path is used to inject the test tone onto the board and to sense its response back
+before ADC sampling.
+
+## Repository Structure
+
+```
+.
+├── signal_simulator.py      # Synthetic "fake hardware" — generates ADC-like signals
+│                            #   for known-good boards and each fault type, so the
+│                            #   whole pipeline can be built/tested before hardware exists
+├── spectral_analysis.py     # Windowing (Hanning/Hamming) + FFT → frequency-domain Signature
+├── baseline_capture.py      # Captures known-good signatures, builds an averaged baseline,
+│                            #   and computes natural board-to-board variance
+├── signature_comparison.py  # Band-limited, energy-weighted scoring: live signature vs. baseline
+├── threshold_calibration.py # Derives a fault threshold from a held-out known-good population
+├── fault_classifier.py      # Rule-based classification: which band deviated, and how,
+│                            #   maps to open-trace / short / regulator / capacitor-drift
+├── signature_database.py    # SQLite persistence: boards, baselines, scan history, CSV/Excel export
+├── pcb_scanner_gui.py       # PyQt5 + PyQtGraph desktop GUI: scan, compare, classify, log
+└── README.md
+```
+
+## Getting Started
+
+### Requirements
+
+```bash
+pip install numpy scipy pandas openpyxl PyQt5 pyqtgraph
+```
+
+### Run the software pipeline on synthetic data (no hardware needed)
+
+```bash
+# 1. Generate synthetic signals and inspect the FFT pipeline
+python3 spectral_analysis.py
+
+# 2. Build a synthetic baseline library (known-good boards + manufacturing jitter)
+python3 baseline_capture.py
+
+# 3. Run the full comparison/scoring sanity test (good vs. every fault type)
+python3 signature_comparison.py
+
+# 4. Calibrate the fault threshold against a held-out known-good population
+python3 threshold_calibration.py
+
+# 5. Launch the desktop GUI (simulated scans, no hardware required)
+python3 pcb_scanner_gui.py
+```
+
+Every module works end-to-end on **synthetic ADC data** generated by
+`signal_simulator.py`. When real hardware is available, only the acquisition layer
+(`acquire_from_hardware()` in `signal_simulator.py`) needs to be replaced with a
+PySerial read from the STM32 — every downstream module (FFT, scoring, threshold,
+classification, GUI, database) is acquisition-agnostic and requires no changes.
+
+## Pipeline Walkthrough
+
+```
+Acquire Signal (synthetic / hardware)
+        │
+        ▼
+Apply Hanning Window
+        │
+        ▼
+Compute FFT (magnitude + phase)
+        │
+        ▼
+Compare vs. Baseline (band-energy weighted)
+        │
+        ▼
+Deviation > Threshold? ──No──▶ PASS (log healthy scan)
+        │
+       Yes
+        │
+        ▼
+Classify Fault Type (rule-based)
+        │
+        ▼
+Log to SQLite + Display in GUI
+```
+
+## Fault Types Detected
+
+| Fault | Signature Behavior |
+|---|---|
+| **Open trace** | Sharp attenuation in a specific frequency band (no return path for the test signal) |
+| **Short circuit** | Impedance collapses — affected band flattens to a low, near-constant amplitude |
+| **Regulator fault** | Extra low-frequency ripple tone appears, plus a phase shift relative to baseline |
+| **Capacitor drift** *(stretch)* | Resonance peak shifts frequency — a heuristic estimate of ESR/capacitance drift, not a lab-grade measurement |
+
+## Known Issues & Fixes
+
+- **Full-spectrum Euclidean distance is noise-dominated.** An early version of
+  `signature_comparison.py` scored the *entire* FFT spectrum, but most bins carry no
+  signal — only broadband noise. This diluted the deviation score enough that healthy
+  and faulty boards were statistically indistinguishable. **Fix:** restrict scoring to
+  frequency bands that carry real signal energy (band-limited, energy-weighted
+  comparison) rather than the raw full-spectrum norm.
+
+## Project Status
+
+| Track | Completion |
+|---|---|
+| Software (simulator, DSP pipeline, calibration, classifier, database, GUI) | **95%** |
+| Hardware (component procurement, front-end design, PCB fabrication) | **50%** |
+| **Overall** | **~73%** |
+
+Remaining software work: hardware acquisition interface (PySerial) and the ML
+auto-classifier stretch goal. Remaining hardware work: front-end PCB fabrication and
+hardware-software integration.
+
+## Roadmap
+
+- [ ] Complete custom front-end PCB fabrication and assembly
+- [ ] Replace the synthetic generator with real STM32F4 + PySerial acquisition
+- [ ] Re-run threshold calibration against real known-good boards (real manufacturing
+      and probe-contact variance)
+- [ ] Validate the classifier against physically induced faults on real boards
+- [ ] Train the ML auto-classifier (k-NN / decision tree) on real acquired signatures
+- [ ] On-device standalone display (LVGL/u8g2) as a stretch goal
+
+## Team
+
+| Name | Reg. No. | Responsibilities |
+|---|---|---|
+| Rhuthresh S | 24EC0171 | Hardware design & analog front-end (protection, buffering, ESD); component procurement; PCB fabrication coordination; hardware-software integration & testing |
+| Pranav Ragavendraa | 24EC0189 | DSP/software pipeline (FFT, scoring, threshold calibration, fault classifier); database design; PyQt5 GUI development; documentation |
+
+---
+
+*Department of Electronics and Communication Engineering — Project-Based Learning, Chennai Institute of Technology.*
